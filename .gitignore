@@ -1,0 +1,7 @@
+lib/
+backup/
+*.exe
+*.ppu
+*.o
+*.lps
+*.bak
