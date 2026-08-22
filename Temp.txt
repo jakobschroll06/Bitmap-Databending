@@ -53,14 +53,15 @@ var
   Form1: TForm1;
   OriginalFilePath: String;
   WorkingBMPPath : String;
-  ActiveImagePath: String; // Tracks working.bmp or new.bmp
-  MasterBmp: TBitmap;      // in memory
+  ActiveImagePath: String; // Tracks whether to show working.bmp or new.bmp
+  MasterBmp: TBitmap;      // Holds the full-res image in memory for fast scaling
 
 implementation
 
 {$R *.lfm}
 
 { TForm1 }
+
 
 
 procedure TForm1.MenuItemOpenImageClick(Sender: TObject);
@@ -78,31 +79,27 @@ begin
     DestBitmap := TBitmap.Create;
     try
       SrcBitmap.LoadFromFile(OriginalFilePath);
+
+      // Force the destination to be a completely clean 24-bit container
       DestBitmap.PixelFormat := pf24bit;
       DestBitmap.Width := SrcBitmap.Width;
       DestBitmap.Height := SrcBitmap.Height;
+
+      // Draw the old image perfectly onto the new 24-bit canvas
       DestBitmap.Canvas.Draw(0, 0, SrcBitmap);
+
+      // Save the clean 24-bit copy
       DestBitmap.SaveToFile(WorkingBMPPath);
+
+      // Display it cleanly
+      Image1.Picture.LoadFromFile(WorkingBMPPath);
+
+      if CheckBoxFit.Checked then
+         CheckBoxFitChange(Sender);
+
     finally
       SrcBitmap.Free;
       DestBitmap.Free;
-    end;
-
-    // Set active path to clean working image and load into memory
-    ActiveImagePath := WorkingBMPPath;
-
-    if MasterBmp = nil then MasterBmp := TBitmap.Create;
-    MasterBmp.LoadFromFile(ActiveImagePath);
-
-    // Display image
-    if CheckBoxFit.Checked then
-      CheckBoxFitChange(Sender)
-    else
-    begin
-      ScrollBox1.AutoScroll := True;
-      Image1.Picture.Assign(MasterBmp);
-      Image1.Width := MasterBmp.Width;
-      Image1.Height := MasterBmp.Height;
     end;
   end;
 end;
@@ -172,9 +169,10 @@ end;
 procedure TForm1.Button1Click(Sender: TObject);
 var
   InStream, OutStream: TFileStream;
-  HeaderBuffer: array of Byte;
+  HeaderBuffer: array of Byte; // Changed to dynamic array
   PixelBuffer: array of Byte;
-  PixelDataOffset: LongWord;
+
+  PixelDataOffset: LongWord;   // 32-bit unsigned integer for the offset
   PixelDataSize: Int64;
   OutputPath: String;
   Intensity: Integer;
@@ -192,19 +190,28 @@ begin
   OutStream := TFileStream.Create(OutputPath, fmCreate);
 
   try
+    // 1. Read the first 14 bytes to find out where the header ends
     SetLength(HeaderBuffer, 14);
     InStream.Read(HeaderBuffer[0], 14);
+
+    // 2. Extract the 32-bit integer from bytes 10-13
+    // Move maps the 4 raw bytes directly into our LongWord variable
     Move(HeaderBuffer[10], PixelDataOffset, 4);
 
+    // 3. Resize our header buffer to match the actual header size and read the rest
     SetLength(HeaderBuffer, PixelDataOffset);
-    InStream.Position := 0;
+    InStream.Position := 0; // Reset stream pointer to beginning
     InStream.Read(HeaderBuffer[0], PixelDataOffset);
+
+    // 4. Write the exact header block to the output file
     OutStream.Write(HeaderBuffer[0], PixelDataOffset);
 
+    // 5. Calculate the remaining raw pixel bytes safely
     PixelDataSize := InStream.Size - PixelDataOffset;
     SetLength(PixelBuffer, PixelDataSize);
     InStream.Read(PixelBuffer[0], PixelDataSize);
 
+    // Run your data bending functions
     case RadioGroup1.ItemIndex of
       0: ApplyChannelSwap(PixelBuffer, PixelDataSize, Intensity);
       1: ApplyInvertBlock(PixelBuffer, PixelDataSize, Intensity);
@@ -213,7 +220,9 @@ begin
       4: ApplyCRTScanlines(PixelBuffer, PixelDataSize, Intensity);
     end;
 
+    // Write modified pixels
     OutStream.Write(PixelBuffer[0], PixelDataSize);
+
   finally
     SetLength(HeaderBuffer, 0);
     SetLength(PixelBuffer, 0);
@@ -221,66 +230,65 @@ begin
     OutStream.Free;
   end;
 
-  // Switch active path to output file and load into memory
-  ActiveImagePath := OutputPath;
+  // UI Refresh logic
+  Image1.Picture.Assign(nil);
+  Image1.Picture.LoadFromFile(OutputPath);
 
-  if MasterBmp = nil then MasterBmp := TBitmap.Create;
-  MasterBmp.LoadFromFile(ActiveImagePath);
-
-  // Refresh UI display
   if CheckBoxFit.Checked then
-    CheckBoxFitChange(Sender)
-  else
-  begin
-    ScrollBox1.AutoScroll := True;
-    Image1.Picture.Assign(MasterBmp);
-    Image1.Width := MasterBmp.Width;
-    Image1.Height := MasterBmp.Height;
-  end;
+  CheckBoxFitChange(Sender);
 end;
+
 
 procedure TForm1.CheckBoxFitChange(Sender: TObject);
 var
-  ScaledBmp: TBitmap;
+  SrcBmp, ScaledBmp: TBitmap;
   RatioW, RatioH, ScaleFactor: Double;
   NewWidth, NewHeight: Integer;
 begin
-  if (MasterBmp = nil) or (MasterBmp.Empty) then Exit;
+  if WorkingBMPPath = '' then Exit;
 
   if CheckBoxFit.Checked then
   begin
+    // 1. Turn off scrollbars while fitting
     ScrollBox1.AutoScroll := False;
+
+    SrcBmp := TBitmap.Create;
     ScaledBmp := TBitmap.Create;
     try
-      // ratio
-      RatioW := ScrollBox1.ClientWidth / MasterBmp.Width;
-      RatioH := ScrollBox1.ClientHeight / MasterBmp.Height;
+      SrcBmp.LoadFromFile(WorkingBMPPath);
+
+      // 2. Calculate scaling ratios to fit inside ScrollBox client area
+      RatioW := ScrollBox1.ClientWidth / SrcBmp.Width;
+      RatioH := ScrollBox1.ClientHeight / SrcBmp.Height;
 
       if RatioW < RatioH then
         ScaleFactor := RatioW
       else
         ScaleFactor := RatioH;
 
+      // Ensure we don't scale up small images if we only want to fit large ones down
       if ScaleFactor > 1.0 then
         ScaleFactor := 1.0;
 
-      NewWidth := Round(MasterBmp.Width * ScaleFactor);
-      NewHeight := Round(MasterBmp.Height * ScaleFactor);
+      NewWidth := Round(SrcBmp.Width * ScaleFactor);
+      NewHeight := Round(SrcBmp.Height * ScaleFactor);
 
+      // 3. Create a scaled target bitmap
       ScaledBmp.PixelFormat := pf24bit;
       ScaledBmp.Width := NewWidth;
       ScaledBmp.Height := NewHeight;
 
-      // master from memory
-      ScaledBmp.Canvas.StretchDraw(Rect(0, 0, NewWidth, NewHeight), MasterBmp);
+      // Draw the original resized into the new bitmap
+      ScaledBmp.Canvas.StretchDraw(Rect(0, 0, NewWidth, NewHeight), SrcBmp);
 
+      // 4. Assign the scaled image to Image1
       Image1.Picture.Assign(ScaledBmp);
       Image1.Width := NewWidth;
       Image1.Height := NewHeight;
-      Image1.Stretch := False;
+      Image1.Stretch := False; // Handled manually by our bitmap resizing
       Image1.Proportional := False;
 
-      // Center in viewport
+      // 5. Center Image1 inside the ScrollBox viewport
       if ScrollBox1.ClientWidth > Image1.Width then
         Image1.Left := (ScrollBox1.ClientWidth - Image1.Width) div 2
       else
@@ -290,18 +298,20 @@ begin
         Image1.Top := (ScrollBox1.ClientHeight - Image1.Height) div 2
       else
         Image1.Top := 0;
+
     finally
+      SrcBmp.Free;
       ScaledBmp.Free;
     end;
   end
   else
   begin
-    // Revert to 1:1 view using master
+    // Revert back to native 1:1 pixel size with scrollbars enabled
     Image1.Stretch := False;
     Image1.Proportional := False;
-    Image1.Picture.Assign(MasterBmp);
-    Image1.Width := MasterBmp.Width;
-    Image1.Height := MasterBmp.Height;
+    Image1.Picture.LoadFromFile(WorkingBMPPath);
+    Image1.Width := Image1.Picture.Width;
+    Image1.Height := Image1.Picture.Height;
     Image1.Left := 0;
     Image1.Top := 0;
     ScrollBox1.AutoScroll := True;
@@ -310,4 +320,114 @@ end;
 
 end.
 
+//procedure TForm1.Button1Click(Sender: TObject);
+//var
+//  InStream, OutStream: TFileStream;
+//
+//  HeaderBuffer: array[0..53] of Byte;
+//  PixelBuffer: array of Byte;
+//  PixelDataSize: Int64;
+//  I: Int64;
+//  CurrentByte: Byte;
+//  ScaleFactor: Double;
+//
+//  OutputPath: String;
+//  Intensity: Integer;
+//  ModValue, BurstSize: Integer;
+//begin
+//
+//  if OpenDialog1.FileName = '' then
+//  begin
+//    ShowMessage('Please load a BMP image from the File menu.');
+//    Exit;
+//  end;
+//  Intensity := TrackBar1.Position;
+//  //
+//  //
+//  //ModValue := 20000 - (Intensity * 180);
+//  //BurstSize := Intensity * 40;
+//
+//
+//
+//  OutputPath := ExtractFilePath(OriginalFilePath) + 'new.bmp';
+//
+//
+//  InStream := TFileStream.Create(WorkingBMPPath, fmOpenRead);
+//  OutStream := TFileStream.Create(OutputPath, fmCreate);
+//
+//  try
+//    InStream.Read(HeaderBuffer, 54);
+//    OutStream.Write(HeaderBuffer, 54);
+//
+//    PixelDataSize := InStream.Size - 54;
+//    SetLength(PixelBuffer, PixelDataSize);
+//    InStream.Read(PixelBuffer[0], PixelDataSize);
+//
+//
+//    case RadioGroup1.ItemIndex of
+//      0: ApplyChannelSwap(PixelBuffer, PixelDataSize, Intensity);
+//      1: ApplyInvertBlock(PixelBuffer, PixelDataSize, Intensity);
+//      2: ApplyEchoSmear(PixelBuffer, PixelDataSize, Intensity);
+//      3: ApplyVaporwavePosterizer(PixelBuffer, PixelDataSize, Intensity);
+//      4: ApplyCRTScanlines(PixelBuffer, PixelDataSize, Intensity);
+//    end;
+//
+//
+//    OutStream.Write(PixelBuffer[0], PixelDataSize);
+//    SetLength(PixelBuffer, 0); // Clear
+//
+//  finally
+//
+//    InStream.Free;
+//    OutStream.Free;
+//  end;
+//  Image1.Picture.Assign(nil);
+//
+//  // Reload the newly modified image
+//  Image1.Picture.LoadFromFile(OutputPath);
+//
+//
+//  ScaleFactor := Self.PixelsPerInch / 96.0; // 96 DPI is standard 100% scale
+//
+//  //Image1.AutoSize := False;
+//  //Image1.Stretch := True;
+//  //Image1.Proportional := True;
+//
+//  Image1.Width := Round(Image1.Picture.Width * ScaleFactor);
+//  Image1.Height := Round(Image1.Picture.Height * ScaleFactor);
+//
+//end;
 
+//procedure TForm1.MenuItemOpenImageClick(Sender: TObject);
+//var
+//  TempBitmap: TBitmap;
+//begin
+//  OpenDialog1.Filter := 'BMP Images (*.bmp)|*.bmp';
+//
+//  if OpenDialog1.Execute then
+//  begin
+//    // Store
+//    OriginalFilePath := OpenDialog1.FileName;
+//    WorkingBMPPath := ExtractFilePath(ParamStr(0)) + 'working.bmp';
+//
+//    // Initialize
+//    TempBitmap := TBitmap.Create;
+//    try
+//      //Read
+//      TempBitmap.LoadFromFile(OriginalFilePath);
+//
+//      //24-bit BMP structure
+//      TempBitmap.PixelFormat := pf24bit;
+//
+//      //Save
+//      TempBitmap.SaveToFile(WorkingBMPPath);
+//
+//      //Update
+//      Image1.Picture.LoadFromFile(WorkingBMPPath);
+//
+//    finally
+//      //Clear
+//      TempBitmap.Free;
+//    end;
+//  end;
+//end;
